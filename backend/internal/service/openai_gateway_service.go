@@ -3415,15 +3415,27 @@ func (s *OpenAIGatewayService) handleOAuthSSEToJSON(resp *http.Response, c *gin.
 			}
 			return nil, s.writeOpenAINonStreamingProtocolError(resp, c, msg)
 		}
-		if terminalOK {
-			usage = s.parseSSEUsageFromBody(bodyText)
+		usage = s.parseSSEUsageFromBody(bodyText)
+		if IsOpenAIChatCompletionsCompatibility(c) || IsOpenAICompletionsCompatibility(c) {
+			return nil, s.writeOpenAINonStreamingProtocolError(resp, c, "Upstream returned SSE without a terminal JSON response")
 		}
-		return nil, s.writeOpenAINonStreamingProtocolError(resp, c, "Upstream returned SSE without a terminal JSON response")
+		if originalModel != mappedModel {
+			bodyText = s.replaceModelInSSEBody(bodyText, mappedModel, originalModel)
+		}
+		body = []byte(bodyText)
 	}
 
 	responseheaders.WriteFilteredHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
 
-	c.Data(resp.StatusCode, "application/json; charset=utf-8", body)
+	contentType := "application/json; charset=utf-8"
+	if !ok {
+		contentType = resp.Header.Get("Content-Type")
+		if contentType == "" {
+			contentType = "text/event-stream"
+		}
+	}
+
+	c.Data(resp.StatusCode, contentType, body)
 
 	return usage, nil
 }

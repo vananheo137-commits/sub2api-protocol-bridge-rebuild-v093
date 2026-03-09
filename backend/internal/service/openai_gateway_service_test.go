@@ -1724,6 +1724,7 @@ func TestHandleOAuthSSEToJSON_NoFinalResponseReturnsProtocolError(t *testing.T) 
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
 	c.Request = httptest.NewRequest(http.MethodPost, "/", nil)
+	SetOpenAICompatibilityMode(c, OpenAICompatibilityModeChatCompletions)
 
 	svc := &OpenAIGatewayService{cfg: &config.Config{}}
 	resp := &http.Response{
@@ -1743,6 +1744,31 @@ func TestHandleOAuthSSEToJSON_NoFinalResponseReturnsProtocolError(t *testing.T) 
 	require.Contains(t, rec.Body.String(), `"type":"upstream_error"`)
 	require.Contains(t, rec.Body.String(), "terminal JSON response")
 	require.NotContains(t, rec.Body.String(), `data: {"type":"response.in_progress"}`)
+}
+
+func TestHandleOAuthSSEToJSON_NoFinalResponseResponsesKeepsSSE(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+
+	svc := &OpenAIGatewayService{cfg: &config.Config{}}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+	}
+	body := []byte(strings.Join([]string{
+		`data: {"type":"response.in_progress","response":{"id":"resp_native"}}`,
+		`data: [DONE]`,
+	}, "\n"))
+
+	usage, err := svc.handleOAuthSSEToJSON(resp, c, body, "gpt-4o", "gpt-4o")
+	require.NoError(t, err)
+	require.NotNil(t, usage)
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Contains(t, rec.Header().Get("Content-Type"), "text/event-stream")
+	require.Contains(t, rec.Body.String(), `data: {"type":"response.in_progress","response":{"id":"resp_native"}}`)
+	require.Contains(t, rec.Body.String(), `data: [DONE]`)
 }
 
 func TestHandleOAuthSSEToJSON_ResponseFailedReturnsProtocolError(t *testing.T) {
