@@ -78,17 +78,13 @@ func applyCodexOAuthTransform(reqBody map[string]any, isCodexCLI bool, isCompact
 	// 工具续链需求会影响存储策略与 input 过滤逻辑。
 	needsToolContinuation := NeedsToolContinuation(reqBody)
 
-	model := ""
 	if v, ok := reqBody["model"].(string); ok {
-		model = v
-	}
-	normalizedModel := normalizeCodexModel(model)
-	if normalizedModel != "" {
-		if model != normalizedModel {
-			reqBody["model"] = normalizedModel
+		model := strings.TrimSpace(v)
+		if model != v {
+			reqBody["model"] = model
 			result.Modified = true
 		}
-		result.NormalizedModel = normalizedModel
+		result.NormalizedModel = model
 	}
 
 	if isCompact {

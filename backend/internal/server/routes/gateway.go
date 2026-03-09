@@ -11,7 +11,8 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// RegisterGatewayRoutes 注册 API 网关路由（Claude/OpenAI/Gemini 兼容）
+// RegisterGatewayRoutes registers gateway routes for the supported provider
+// compatibility layers.
 func RegisterGatewayRoutes(
 	r *gin.Engine,
 	h *handler.Handlers,
@@ -31,11 +32,9 @@ func RegisterGatewayRoutes(
 	clientRequestID := middleware.ClientRequestID()
 	opsErrorLogger := handler.OpsErrorLoggerMiddleware(opsService)
 
-	// 未分组 Key 拦截中间件（按协议格式区分错误响应）
 	requireGroupAnthropic := middleware.RequireGroupAssignment(settingService, middleware.AnthropicErrorWriter)
 	requireGroupGoogle := middleware.RequireGroupAssignment(settingService, middleware.GoogleErrorWriter)
 
-	// API网关（Claude API兼容）
 	gateway := r.Group("/v1")
 	gateway.Use(bodyLimit)
 	gateway.Use(clientRequestID)
@@ -43,7 +42,6 @@ func RegisterGatewayRoutes(
 	gateway.Use(gin.HandlerFunc(apiKeyAuth))
 	gateway.Use(requireGroupAnthropic)
 	{
-		// /v1/messages: auto-route based on group platform
 		gateway.POST("/messages", func(c *gin.Context) {
 			if getGroupPlatform(c) == service.PlatformOpenAI {
 				h.OpenAIGateway.Messages(c)
@@ -51,7 +49,6 @@ func RegisterGatewayRoutes(
 			}
 			h.Gateway.Messages(c)
 		})
-		// /v1/messages/count_tokens: OpenAI groups get 404
 		gateway.POST("/messages/count_tokens", func(c *gin.Context) {
 			if getGroupPlatform(c) == service.PlatformOpenAI {
 				c.JSON(http.StatusNotFound, gin.H{
@@ -67,22 +64,13 @@ func RegisterGatewayRoutes(
 		})
 		gateway.GET("/models", h.Gateway.Models)
 		gateway.GET("/usage", h.Gateway.Usage)
-		// OpenAI Responses API
 		gateway.POST("/responses", h.OpenAIGateway.Responses)
 		gateway.POST("/responses/*subpath", h.OpenAIGateway.Responses)
 		gateway.GET("/responses", h.OpenAIGateway.ResponsesWebSocket)
-		// 明确阻止旧协议入口：OpenAI 仅支持 Responses API，避免客户端误解为会自动路由到其它平台。
-		gateway.POST("/chat/completions", func(c *gin.Context) {
-			c.JSON(http.StatusBadRequest, gin.H{
-				"error": gin.H{
-					"type":    "invalid_request_error",
-					"message": "Unsupported legacy protocol: /v1/chat/completions is not supported. Please use /v1/responses.",
-				},
-			})
-		})
+		gateway.POST("/completions", h.OpenAIGateway.Completions)
+		gateway.POST("/chat/completions", h.OpenAIGateway.ChatCompletions)
 	}
 
-	// Gemini 原生 API 兼容层（Gemini SDK/CLI 直连）
 	gemini := r.Group("/v1beta")
 	gemini.Use(bodyLimit)
 	gemini.Use(clientRequestID)
@@ -92,19 +80,15 @@ func RegisterGatewayRoutes(
 	{
 		gemini.GET("/models", h.Gateway.GeminiV1BetaListModels)
 		gemini.GET("/models/:model", h.Gateway.GeminiV1BetaGetModel)
-		// Gin treats ":" as a param marker, but Gemini uses "{model}:{action}" in the same segment.
 		gemini.POST("/models/*modelAction", h.Gateway.GeminiV1BetaModels)
 	}
 
-	// OpenAI Responses API（不带v1前缀的别名）
 	r.POST("/responses", bodyLimit, clientRequestID, opsErrorLogger, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, h.OpenAIGateway.Responses)
 	r.POST("/responses/*subpath", bodyLimit, clientRequestID, opsErrorLogger, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, h.OpenAIGateway.Responses)
 	r.GET("/responses", bodyLimit, clientRequestID, opsErrorLogger, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, h.OpenAIGateway.ResponsesWebSocket)
 
-	// Antigravity 模型列表
 	r.GET("/antigravity/models", gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, h.Gateway.AntigravityModels)
 
-	// Antigravity 专用路由（仅使用 antigravity 账户，不混合调度）
 	antigravityV1 := r.Group("/antigravity/v1")
 	antigravityV1.Use(bodyLimit)
 	antigravityV1.Use(clientRequestID)
@@ -132,7 +116,6 @@ func RegisterGatewayRoutes(
 		antigravityV1Beta.POST("/models/*modelAction", h.Gateway.GeminiV1BetaModels)
 	}
 
-	// Sora 专用路由（强制使用 sora 平台）
 	soraV1 := r.Group("/sora/v1")
 	soraV1.Use(soraBodyLimit)
 	soraV1.Use(clientRequestID)
@@ -145,13 +128,11 @@ func RegisterGatewayRoutes(
 		soraV1.GET("/models", h.Gateway.Models)
 	}
 
-	// Sora 媒体代理（可选 API Key 验证）
 	if cfg.Gateway.SoraMediaRequireAPIKey {
 		r.GET("/sora/media/*filepath", gin.HandlerFunc(apiKeyAuth), h.SoraGateway.MediaProxy)
 	} else {
 		r.GET("/sora/media/*filepath", h.SoraGateway.MediaProxy)
 	}
-	// Sora 媒体代理（签名 URL，无需 API Key）
 	r.GET("/sora/media-signed/*filepath", h.SoraGateway.MediaProxySigned)
 }
 
