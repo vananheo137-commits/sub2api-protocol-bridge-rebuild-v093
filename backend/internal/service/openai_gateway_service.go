@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	"github.com/Wei-Shaw/sub2api/internal/util/responseheaders"
@@ -1627,17 +1628,10 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		markPatchSet("model", mappedModel)
 	}
 
-	// 针对所有 OpenAI 账号执行 Codex 模型名规范化，确保上游识别一致。
+	// Compatibility mode keeps the client-requested model unless an explicit
+	// account/group model mapping has already changed it above.
 	if model, ok := reqBody["model"].(string); ok {
-		normalizedModel := normalizeCodexModel(model)
-		if normalizedModel != "" && normalizedModel != model {
-			logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Codex model normalization: %s -> %s (account: %s, type: %s, isCodexCLI: %v)",
-				model, normalizedModel, account.Name, account.Type, isCodexCLI)
-			reqBody["model"] = normalizedModel
-			mappedModel = normalizedModel
-			bodyModified = true
-			markPatchSet("model", normalizedModel)
-		}
+		_ = model
 	}
 
 	// 规范化 reasoning.effort 参数（minimal -> none），与上游允许值对齐。
@@ -2961,6 +2955,16 @@ func (s *OpenAIGatewayService) handleStreamingResponse(ctx context.Context, resp
 	}
 
 	needModelReplace := originalModel != mappedModel
+	compatMode := GetOpenAICompatibilityMode(c)
+	compatChatCompletions := compatMode == OpenAICompatibilityModeChatCompletions
+	compatCompletions := compatMode == OpenAICompatibilityModeCompletions
+	var chatStreamState *apicompat.OpenAIChatCompletionsStreamState
+	var completionsStreamState *apicompat.OpenAICompletionsStreamState
+	if compatChatCompletions {
+		chatStreamState = apicompat.NewOpenAIChatCompletionsStreamState(originalModel)
+	} else if compatCompletions {
+		completionsStreamState = apicompat.NewOpenAICompletionsStreamState(originalModel)
+	}
 	resultWithUsage := func() *openaiStreamingResult {
 		return &openaiStreamingResult{usage: usage, firstTokenMs: firstTokenMs}
 	}
@@ -3001,6 +3005,59 @@ func (s *OpenAIGatewayService) handleStreamingResponse(ctx context.Context, resp
 
 		// Extract data from SSE line (supports both "data: " and "data:" formats)
 		if data, ok := extractOpenAISSEDataLine(line); ok {
+			if compatChatCompletions || compatCompletions {
+				if data == "" || data == "[DONE]" {
+					return
+				}
+
+				dataBytes := []byte(data)
+				if correctedData, corrected := s.toolCorrector.CorrectToolCallsInSSEBytes(dataBytes); corrected {
+					dataBytes = correctedData
+				}
+
+				var (
+					payloads   [][]byte
+					streamDone bool
+					compatErr  error
+					writeErr   error
+				)
+				switch compatMode {
+				case OpenAICompatibilityModeChatCompletions:
+					payloads, streamDone, compatErr = s.convertOpenAIResponsesEventToChatCompletions(chatStreamState, dataBytes)
+				case OpenAICompatibilityModeCompletions:
+					payloads, streamDone, compatErr = s.convertOpenAIResponsesEventToCompletions(completionsStreamState, dataBytes)
+				}
+				if compatErr == nil {
+					if !clientDisconnected && (len(payloads) > 0 || streamDone) {
+						shouldFlush := queueDrained
+						if firstTokenMs == nil && len(payloads) > 0 {
+							shouldFlush = true
+						}
+						switch compatMode {
+						case OpenAICompatibilityModeChatCompletions:
+							writeErr = writeOpenAIChatCompletionsSSEPayloads(bufferedWriter, payloads, streamDone)
+						case OpenAICompatibilityModeCompletions:
+							writeErr = writeOpenAICompletionsSSEPayloads(bufferedWriter, payloads, streamDone)
+						}
+						if writeErr != nil {
+							clientDisconnected = true
+							logger.LegacyPrintf("service.openai_gateway", "Client disconnected during compatibility streaming, continuing to drain upstream for billing")
+						} else if shouldFlush {
+							if err := flushBuffered(); err != nil {
+								clientDisconnected = true
+								logger.LegacyPrintf("service.openai_gateway", "Client disconnected during compatibility streaming flush, continuing to drain upstream for billing")
+							}
+						}
+					}
+					if firstTokenMs == nil && len(payloads) > 0 {
+						ms := int(time.Since(startTime).Milliseconds())
+						firstTokenMs = &ms
+					}
+					s.parseSSEUsageBytes(dataBytes, usage)
+					return
+				}
+				logger.LegacyPrintf("service.openai_gateway", "compatibility streaming conversion failed: %v", compatErr)
+			}
 
 			// Replace model in response if needed.
 			// Fast path: most events do not contain model field values.
@@ -3044,6 +3101,10 @@ func (s *OpenAIGatewayService) handleStreamingResponse(ctx context.Context, resp
 				firstTokenMs = &ms
 			}
 			s.parseSSEUsageBytes(dataBytes, usage)
+			return
+		}
+
+		if compatChatCompletions || compatCompletions {
 			return
 		}
 
@@ -3224,11 +3285,12 @@ func (s *OpenAIGatewayService) parseSSEUsageBytes(data []byte, usage *OpenAIUsag
 	if usage == nil || len(data) == 0 || bytes.Equal(data, []byte("[DONE]")) {
 		return
 	}
-	// 选择性解析：仅在数据中包含 completed 事件标识时才进入字段提取。
-	if len(data) < 80 || !bytes.Contains(data, []byte(`"response.completed"`)) {
+	// 选择性解析：仅在数据中包含 terminal 事件标识时才进入字段提取。
+	if len(data) < 64 || (!bytes.Contains(data, []byte(`"response.completed"`)) && !bytes.Contains(data, []byte(`"response.done"`))) {
 		return
 	}
-	if gjson.GetBytes(data, "type").String() != "response.completed" {
+	eventType := gjson.GetBytes(data, "type").String()
+	if eventType != "response.completed" && eventType != "response.done" {
 		return
 	}
 
@@ -3270,11 +3332,9 @@ func (s *OpenAIGatewayService) handleNonStreamingResponse(ctx context.Context, r
 		return nil, err
 	}
 
-	if account.Type == AccountTypeOAuth {
-		bodyLooksLikeSSE := bytes.Contains(body, []byte("data:")) || bytes.Contains(body, []byte("event:"))
-		if isEventStreamResponse(resp.Header) || bodyLooksLikeSSE {
-			return s.handleOAuthSSEToJSON(resp, c, body, originalModel, mappedModel)
-		}
+	bodyLooksLikeSSE := bytes.Contains(body, []byte("data:")) || bytes.Contains(body, []byte("event:"))
+	if isEventStreamResponse(resp.Header) || bodyLooksLikeSSE {
+		return s.handleOAuthSSEToJSON(resp, c, body, originalModel, mappedModel)
 	}
 
 	usageValue, usageOK := extractOpenAIUsageFromJSONBytes(body)
@@ -3286,6 +3346,17 @@ func (s *OpenAIGatewayService) handleNonStreamingResponse(ctx context.Context, r
 	// Replace model in response if needed
 	if originalModel != mappedModel {
 		body = s.replaceModelInResponseBody(body, mappedModel, originalModel)
+	}
+	if IsOpenAIChatCompletionsCompatibility(c) {
+		body, err = s.convertResponsesBodyToChatCompletions(body)
+		if err != nil {
+			return nil, err
+		}
+	} else if IsOpenAICompletionsCompatibility(c) {
+		body, err = s.convertResponsesBodyToCompletions(body)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	responseheaders.WriteFilteredHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
@@ -3322,6 +3393,19 @@ func (s *OpenAIGatewayService) handleOAuthSSEToJSON(resp *http.Response, c *gin.
 		}
 		// Correct tool calls in final response
 		body = s.correctToolCallsInResponseBody(body)
+		if IsOpenAIChatCompletionsCompatibility(c) {
+			convertedBody, err := s.convertResponsesBodyToChatCompletions(body)
+			if err != nil {
+				return nil, err
+			}
+			body = convertedBody
+		} else if IsOpenAICompletionsCompatibility(c) {
+			convertedBody, err := s.convertResponsesBodyToCompletions(body)
+			if err != nil {
+				return nil, err
+			}
+			body = convertedBody
+		}
 	} else {
 		terminalType, terminalPayload, terminalOK := extractOpenAISSETerminalEvent(bodyText)
 		if terminalOK && terminalType == "response.failed" {
@@ -3332,6 +3416,9 @@ func (s *OpenAIGatewayService) handleOAuthSSEToJSON(resp *http.Response, c *gin.
 			return nil, s.writeOpenAINonStreamingProtocolError(resp, c, msg)
 		}
 		usage = s.parseSSEUsageFromBody(bodyText)
+		if IsOpenAIChatCompletionsCompatibility(c) || IsOpenAICompletionsCompatibility(c) {
+			return nil, s.writeOpenAINonStreamingProtocolError(resp, c, "Upstream returned SSE without a terminal JSON response")
+		}
 		if originalModel != mappedModel {
 			bodyText = s.replaceModelInSSEBody(bodyText, mappedModel, originalModel)
 		}
@@ -3347,6 +3434,7 @@ func (s *OpenAIGatewayService) handleOAuthSSEToJSON(resp *http.Response, c *gin.
 			contentType = "text/event-stream"
 		}
 	}
+
 	c.Data(resp.StatusCode, contentType, body)
 
 	return usage, nil
