@@ -431,6 +431,43 @@ func TestOpenAIResponses_RejectsMessageIDAsPreviousResponseID(t *testing.T) {
 	require.Contains(t, w.Body.String(), "previous_response_id must be a response.id")
 }
 
+func TestOpenAIResponses_CompatibilityEntryDoesNotRewriteModelWithoutExplicitMapping(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	body := `{"model":"gpt-5.4-pro","stream":false,"input":[{"type":"function_call_output","output":"hello"}]}`
+	c.Request = httptest.NewRequest(http.MethodPost, "/openai/v1/responses", strings.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	groupID := int64(2)
+	c.Set(string(middleware.ContextKeyAPIKey), &service.APIKey{
+		ID:      101,
+		GroupID: &groupID,
+		User:    &service.User{ID: 1},
+	})
+	c.Set(string(middleware.ContextKeyUser), middleware.AuthSubject{
+		UserID:      1,
+		Concurrency: 1,
+	})
+
+	h := newOpenAIHandlerForPreviousResponseIDValidation(t, nil)
+	h.Responses(c)
+
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	require.Contains(t, w.Body.String(), "function_call_output requires call_id or previous_response_id")
+
+	modelValue, ok := c.Get(opsModelKey)
+	require.True(t, ok)
+	require.Equal(t, "gpt-5.4-pro", modelValue)
+
+	bodyValue, ok := c.Get(opsRequestBodyKey)
+	require.True(t, ok)
+	normalizedBody, ok := bodyValue.([]byte)
+	require.True(t, ok)
+	require.Equal(t, "gpt-5.4-pro", gjson.GetBytes(normalizedBody, "model").String())
+}
+
 func TestOpenAIResponsesWebSocket_SetsClientTransportWSWhenUpgradeValid(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

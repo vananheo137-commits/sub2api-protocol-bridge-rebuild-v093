@@ -1,10 +1,12 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"runtime/debug"
 	"strconv"
@@ -12,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
 	pkghttputil "github.com/Wei-Shaw/sub2api/internal/pkg/httputil"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ip"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
@@ -381,6 +384,62 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		)
 		return
 	}
+}
+
+// ChatCompletions handles the legacy OpenAI Chat Completions endpoint by
+// translating the request into a Responses API request and reusing the same
+// gateway pipeline so auth, grouping, billing, and logging rules stay intact.
+func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
+	h.proxyCompatibilityRequestToResponses(c, service.OpenAICompatibilityModeChatCompletions, apicompat.OpenAIChatCompletionsToResponses)
+}
+
+// Completions handles the legacy OpenAI Completions endpoint by translating
+// it into a Responses API request and delegating back into the same gateway
+// pipeline so auth, grouping, billing, and logging rules remain unchanged.
+func (h *OpenAIGatewayHandler) Completions(c *gin.Context) {
+	h.proxyCompatibilityRequestToResponses(c, service.OpenAICompatibilityModeCompletions, apicompat.OpenAICompletionsToResponses)
+}
+
+func (h *OpenAIGatewayHandler) proxyCompatibilityRequestToResponses(
+	c *gin.Context,
+	mode service.OpenAICompatibilityMode,
+	convert func([]byte) ([]byte, error),
+) {
+	body, err := pkghttputil.ReadRequestBodyWithPrealloc(c.Request)
+	if err != nil {
+		if maxErr, ok := extractMaxBytesError(err); ok {
+			h.errorResponse(c, http.StatusRequestEntityTooLarge, "invalid_request_error", buildBodyTooLargeMessage(maxErr.Limit))
+			return
+		}
+		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Failed to read request body")
+		return
+	}
+	if len(body) == 0 {
+		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Request body is empty")
+		return
+	}
+
+	body, err = service.NormalizeOpenAICompatibilityRequestBody(body)
+	if err != nil {
+		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Failed to parse request body")
+		return
+	}
+
+	convertedBody, err := convert(body)
+	if err != nil {
+		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Failed to parse request body")
+		return
+	}
+
+	service.SetOpenAICompatibilityMode(c, mode)
+	c.Set(service.OpenAIParsedRequestBodyKey, nil)
+	c.Request.Body = io.NopCloser(bytes.NewReader(convertedBody))
+	c.Request.ContentLength = int64(len(convertedBody))
+	c.Request.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(convertedBody)), nil
+	}
+
+	h.Responses(c)
 }
 
 func isOpenAIRemoteCompactPath(c *gin.Context) bool {
